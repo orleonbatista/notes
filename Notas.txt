@@ -1,0 +1,328 @@
+
+
+Por que no body (resumo)
+	•	Multi-tenant: o mesmo endpoint atende N queue managers; o target varia por request.
+	•	Idempotência: o hash do body inclui queueManager+queue+conn, garantindo chave única por alvo.
+	•	Evolução: você pode acrescentar canal, TLS, CCDT, overrides sem quebrar rota.
+	•	Observabilidade: fácil logar/propagar target e tags por request.
+	•	Ações: produce/consume/test são comandos; body expressa a intenção completa.
+
+Modelo sugerido de endpoints
+	•	POST /messages/produce → put em lote
+	•	POST /messages/consume → get/browse em lote
+	•	POST /queue/depth → consulta de profundidade
+	•	POST /connections/test → teste de conectividade
+	•	POST /tests | GET /tests/{id} | POST /tests/{id}/stop
+	•	(GET /health/*, GET /metrics, GET /status ficam como estão)
+
+Payload (com target)
+
+{
+  "target": {
+    "queueManager": "QM1",
+    "queue": "DEV.QUEUE.1",
+    "channel": "DEV.APP.SVRCONN",
+    "connName": "mq.host:1414",
+    "ccdtUrl": null,
+    "ssl": { "enabled": false },
+    "auth": { "user": "app", "passwordRef": "secret://mq/app" }
+  },
+  "batch": {
+    "count": 1000,
+    "messageSizeBytes": 2048,
+    "rateLimitPerSec": null,
+    "transaction": { "enabled": true, "txSize": 100 }
+  },
+  "payload": { "mode": "random" },
+  "mqProps": {
+    "persistence": "persistent",
+    "priority": 0,
+    "expiryMs": 0,
+    "correlIdMode": "none"
+  },
+  "headers": { "k1": "v1" }
+}
+
+Consumo
+
+{
+  "target": {
+    "queueManager": "QM1",
+    "queue": "DEV.QUEUE.1",
+    "channel": "DEV.APP.SVRCONN",
+    "connName": "mq.host:1414"
+  },
+  "maxMessages": 500,
+  "waitSeconds": 20,
+  "browseOnly": false,
+  "selector": { "correlIdBase64": null, "msgIdBase64": null },
+  "transaction": { "enabled": true, "txSize": 100 },
+  "ack": "commit"
+}
+
+Depth
+
+{
+  "target": {
+    "queueManager": "QM1",
+    "queue": "DEV.QUEUE.1",
+    "channel": "DEV.APP.SVRCONN",
+    "connName": "mq.host:1414"
+  }
+}
+
+Idempotência (DynamoDB)
+	•	Header: Idempotency-Key: <uuid>
+	•	Chave composta lógica = hash( body_normalizado ) + Idempotency-Key
+(inclui todo target e parâmetros de lote/payload).
+	•	Item: { pk: Idempotency-Key, sk: requestHash, status, responseBody, ttl }
+	•	Se Idempotency-Key existir com mesmo requestHash → replay seguro (Idempotent-Replay:true).
+	•	Se existir com hash diferente → 409 Conflict.
+
+Segurança/ergonomia (opcional)
+	•	Perfis de conexão: permitir targetRef (ex.: "targetRef":"lab-qm1") e resolver server-side; ainda aceitar target inline para override.
+	•	Rate limiting por targetRef/QM.
+	•	Auditoria: logar tenant, targetRef, queue, qm.
+
+OpenAPI 3.1 (esqueleto mínimo)
+
+paths:
+  /messages/produce:
+    post:
+      summary: Produce messages (batch)
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProduceReq' } } }
+      responses:
+        "201": { description: Enqueued, headers: { Idempotent-Replay: { schema: { type: string } } } }
+  /messages/consume:
+    post:
+      summary: Consume/Browse messages (batch)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ConsumeReq' } } }
+      responses: { "200": { description: Fetched } }
+  /queue/depth:
+    post:
+      summary: Queue depth
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TargetOnly' } } }
+      responses: { "200": { description: OK } }
+  /connections/test:
+    post:
+      summary: Test MQ connection
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TargetFull' } } }
+      responses: { "200": { description: OK } }
+components:
+  schemas:
+    TargetFull:
+      type: object
+      required: [queueManager, queue]
+      properties:
+        queueManager: { type: string }
+        queue: { type: string }
+        channel: { type: string }
+        connName: { type: string }
+        ccdtUrl: { type: string, nullable: true }
+        ssl:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            keyStoreRef: { type: string }
+            trustStoreRef: { type: string }
+        auth:
+          type: object
+          properties:
+            user: { type: string }
+            passwordRef: { type: string }
+    TargetOnly:
+      type: object
+      required: [target]
+      properties:
+        target: { $ref: '#/components/schemas/TargetFull' }
+    ProduceReq:
+      allOf:
+        - $ref: '#/components/schemas/TargetOnly'
+        - type: object
+          properties:
+            batch:
+              type: object
+              properties:
+                count: { type: integer, minimum: 1 }
+                messageSizeBytes: { type: integer, minimum: 0 }
+                rateLimitPerSec: { type: integer, minimum: 1, nullable: true }
+                transaction:
+                  type: object
+                  properties:
+                    enabled: { type: boolean }
+                    txSize: { type: integer, minimum: 1 }
+            payload:
+              type: object
+              properties:
+                mode: { type: string, enum: [random, fixed, template] }
+                fixedBase64: { type: string, nullable: true }
+                template: { type: string, nullable: true }
+            mqProps:
+              type: object
+              properties:
+                persistence: { type: string, enum: [persistent, nonpersistent] }
+                priority: { type: integer, minimum: 0, maximum: 9 }
+                expiryMs: { type: integer, minimum: 0 }
+                correlIdMode: { type: string, enum: [none, echoMsgId, fixed] }
+                fixedCorrelIdBase64: { type: string, nullable: true }
+            headers: { type: object, additionalProperties: { type: string } }
+    ConsumeReq:
+      allOf:
+        - $ref: '#/components/schemas/TargetOnly'
+        - type: object
+          properties:
+            maxMessages: { type: integer, minimum: 1, default: 1 }
+            waitSeconds: { type: integer, minimum: 0, maximum: 60, default: 20 }
+            browseOnly: { type: boolean, default: false }
+            selector:
+              type: object
+              properties:
+                correlIdBase64: { type: string, nullable: true }
+                msgIdBase64: { type: string, nullable: true }
+            transaction:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                txSize: { type: integer, minimum: 1 }
+            ack: { type: string, enum: [commit, rollback, none], default: commit }
+
+Perfeito — vamos complementar o desenho anterior com o modelo da tabela DynamoDB, seguindo boas práticas para idempotência, rastreabilidade e limpeza automática (TTL).
+
+⸻
+
+🧩 Modelo da tabela DynamoDB – mq-probe-idempotency
+
+Propósito
+
+Garantir idempotência forte nas requisições mutáveis (como produce, consume e test), de modo que:
+	•	requisições repetidas com o mesmo corpo e Idempotency-Key retornem a mesma resposta;
+	•	requisições com a mesma Idempotency-Key mas payload diferente gerem 409 Conflict;
+	•	entradas antigas sejam limpas automaticamente via TTL.
+
+⸻
+
+Esquema
+
+Campo	Tipo	Descrição
+pk	STRING	Chave primária (Idempotency-Key) — fornecida pelo cliente via header.
+sk	STRING	Hash (SHA-256) do corpo normalizado da requisição.
+status	STRING	Estado do processamento (PENDING, SUCCEEDED, FAILED, EXPIRED).
+responseBody	STRING (JSON)	Corpo da resposta retornada pela API (armazenado para replay).
+httpStatus	NUMBER	Código HTTP original da resposta.
+firstSeenAt	STRING (ISO-8601)	Data/hora da primeira execução.
+lastSeenAt	STRING (ISO-8601)	Última vez que a mesma chave foi consultada.
+ttl	NUMBER	Epoch timestamp (Unix seconds) de expiração (para limpeza automática).
+requestHash	STRING	SHA-256 do corpo da requisição (igual ao sk para facilitar leitura via GSI).
+target	STRING	Identificador lógico do alvo (ex: QM1:DEV.QUEUE.1).
+traceId	STRING	ID de rastreio (propagado do header X-Trace-Id ou gerado internamente).
+durationMs	NUMBER	Tempo total de execução em milissegundos.
+errorMessage	STRING (opcional)	Texto do erro (em caso de FAILED).
+
+
+⸻
+
+Chaves e índices
+
+TableName: mq-probe-idempotency
+BillingMode: PAY_PER_REQUEST
+KeySchema:
+  - AttributeName: pk
+    KeyType: HASH
+  - AttributeName: sk
+    KeyType: RANGE
+AttributeDefinitions:
+  - AttributeName: pk
+    AttributeType: S
+  - AttributeName: sk
+    AttributeType: S
+  - AttributeName: requestHash
+    AttributeType: S
+  - AttributeName: target
+    AttributeType: S
+  - AttributeName: ttl
+    AttributeType: N
+TimeToLiveSpecification:
+  AttributeName: ttl
+  Enabled: true
+GlobalSecondaryIndexes:
+  - IndexName: requestHash-index
+    KeySchema:
+      - AttributeName: requestHash
+        KeyType: HASH
+    Projection:
+      ProjectionType: ALL
+  - IndexName: target-index
+    KeySchema:
+      - AttributeName: target
+        KeyType: HASH
+    Projection:
+      ProjectionType: KEYS_ONLY
+
+
+⸻
+
+Fluxo de Idempotência
+	1.	Cliente envia:
+
+POST /messages/produce
+Idempotency-Key: 9c5f8a8f-2d04-4f60-a2e0-83e5ac33d003
+
+
+	2.	Aplicação calcula requestHash = SHA256(normalizedBody).
+	3.	Consulta DynamoDB:
+	•	Se (pk, sk) existe e status=SUCCEEDED → retorna resposta gravada (Idempotent-Replay:true).
+	•	Se (pk) existe, mas requestHash diferente → 409 Conflict.
+	•	Caso contrário → grava item com status=PENDING.
+	4.	Executa operação MQ (put/get/test).
+	5.	Atualiza item com:
+
+{
+  "status": "SUCCEEDED",
+  "responseBody": "{...}",
+  "httpStatus": 201,
+  "durationMs": 2312,
+  "lastSeenAt": "2025-10-28T13:23:12Z"
+}
+
+
+	6.	TTL configurado (ex.: 7 dias → ttl = now + 604800).
+
+⸻
+
+Exemplo de item salvo
+
+{
+  "pk": "9c5f8a8f-2d04-4f60-a2e0-83e5ac33d003",
+  "sk": "9ff21e6aeb194e4cf36e3c6c22d91a73b706ed53e6300dcb4f09cd15f8e6741d",
+  "status": "SUCCEEDED",
+  "requestHash": "9ff21e6aeb194e4cf36e3c6c22d91a73b706ed53e6300dcb4f09cd15f8e6741d",
+  "target": "QM1:DEV.QUEUE.1",
+  "traceId": "abc123ef-45fa-67b9-89a1-23cd456ef789",
+  "responseBody": "{\"enqueued\":1000,\"avgLatencyMs\":3.2}",
+  "httpStatus": 201,
+  "firstSeenAt": "2025-10-28T13:23:12Z",
+  "lastSeenAt": "2025-10-28T13:23:14Z",
+  "ttl": 1761715394
+}
+
+
+⸻
+
+Boas práticas extras
+	•	✅ Atomicidade: usar PutItem com ConditionExpression attribute_not_exists(pk) para criar novos e evitar corrida.
+	•	✅ Consistência: usar TransactWriteItems se quiser criar o log + status juntos.
+	•	✅ Performance: TTL + índice target-index permitem limpezas e dashboards por fila/QM.
+	•	✅ Auditoria: salvar traceId e target permite cruzar logs no Datadog.
+	•	✅ Retenção: 7–30 dias é o ideal; idempotência raramente precisa de mais.
