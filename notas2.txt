@@ -1,0 +1,277 @@
+
+
+⸻
+
+PROMPT — “MQ Probe API (Spring + IBM MQ)”
+
+Contexto & Objetivo
+Implemente uma API em Spring Boot 3.5.5 (Java 21) com duas rotas principais: POST /produce e POST /consume.
+A API recebe no payload todos os parâmetros de conexão ao IBM MQ (rodando em EC2 na AWS) e configura a conexão dinamicamente.
+A aplicação serve como probe e teste de performance, portanto priorize estabilidade de conexão, alto throughput e controle de paralelismo.
+Aplique Clean Architecture + SOLID (camadas: api → application → domain → infrastructure).
+
+⸻
+
+Requisitos Funcionais
+	1.	/produce
+	•	Recebe payload (JSON) com:
+
+{
+  "idempotencyKey": "abc-1111",
+  "queueManager": {
+    "name": "SMD1199AWS",
+    "channel": "MQFORWARDER",
+    "endpoints": [{ "host": "sndl199aws.mq.dev.ops.aws.cloud.ihf", "port": 6000 }],
+    "credentials": { "username": "mq00012", "password": "xxx" },
+    "useTLS": false,
+    "cipherSuite": null,
+    "userAuthMqCSP": false
+  },
+  "target": { "queueName": "ORLEON.DEST", "replyToQueue": "ORLEON.DEST" },
+  "settings": {
+    "totalMessages": 1,
+    "batchSize": 1,
+    "concurrency": 1,
+    "deliveryDelay": "PT0S",     // ISO-8601
+    "timeToLive": "P1D",         // ISO-8601
+    "persistent": true,
+    "probe": false
+  },
+  "messages": [
+    {
+      "body": "teste host",
+      "format": "TEXT",          // TEXT | BYTES
+      "headers": { "CorrelationId": "abc-4001" },
+      "properties": { "customProp": "value" }
+    }
+  ]
+}
+
+
+	•	Comportamento:
+	•	Abre 1 Connection por requisição.
+	•	Cria N Sessions (= concurrency) e envia totalMessages dividido entre as N workers (paralelo).
+	•	Cada worker envia em lotes de batchSize (otimiza alocações e logs).
+	•	Define DeliveryMode conforme persistent (PERSISTENT/NON_PERSISTENT).
+	•	Define TimeToLive e DeliveryDelay convertendo ISO-8601 para millis.
+	•	Opcional: se replyToQueue presente, seta JMSReplyTo.
+	•	Seta JMSCorrelationID (se presente em headers) e todas as properties como Message Properties.
+	•	Put Async habilitado na fila (quando non-persistent) e reuse de Session dentro do worker.
+
+	2.	/consume
+	•	Recebe payload (JSON) com:
+
+{
+  "idempotencyKey": "abc-128",
+  "queueManager": {
+    "name": "SMD1199AWS",
+    "channel": "MQFORWARDER",
+    "endpoints": [{ "host": "sndl199aws.mq.dev.ops.aws.cloud.ihf", "port": 6000 }],
+    "credentials": { "username": "mq00012", "password": "xxx" },
+    "useTLS": false,
+    "cipherSuite": "string"
+  },
+  "target": { "queueName": "ORLEON.DEST", "replyToQueue": "ORLEON.DEST" },
+  "settings": {
+    "maxMessages": 5000,
+    "waitTimeout": "PT5S",
+    "autoAcknowledge": true,
+    "concurrency": 1  // adicione este campo para paralelismo também no consumo
+  }
+}
+
+
+	•	Comportamento:
+	•	Abre 1 Connection por requisição.
+	•	Cria N Sessions/Consumers (= concurrency) para ler em paralelo.
+	•	Cada worker executa receive(timeout) em loop até atingir sua cota (maxMessages / concurrency) ou null por timeout.
+	•	AUTO_ACK se autoAcknowledge = true; caso false, use CLIENT_ACK e chame acknowledge() ao processar (mantendo simplicidade).
+	•	Read Ahead habilitado para non-persistent (quando aplicável) para ganho de throughput.
+
+⸻
+
+Requisitos Não Funcionais (Conexão & Robustez)
+	•	Criar ConnectionFactory dinamicamente por payload usando Jakarta JMS (jakarta.jms.*) e IBM MQ JMS (com.ibm.mq.jakarta.jms.MQQueueConnectionFactory e com.ibm.msg.client.wmq.WMQConstants).
+	•	Propriedades a setar no factory:
+	•	setHostName, setPort, setQueueManager, setChannel
+	•	setTransportType(WMQConstants.WMQ_CM_CLIENT)
+	•	setStringProperty(WMQConstants.WMQ_APPLICATIONNAME, "mq-probe-api")
+	•	Reconexão automática:
+	•	setIntProperty(WMQConstants.WMQ_CLIENT_RECONNECT_OPTIONS, WMQConstants.WMQ_CLIENT_RECONNECT)
+	•	setIntProperty(WMQConstants.WMQ_CLIENT_RECONNECT_TIMEOUT, 30) // segundos
+	•	TCP KeepAlive:
+	•	setBooleanProperty(WMQConstants.WMQ_TCP_KEEP_ALIVE, true)
+	•	Auth: se credentials presentes:
+	•	setBooleanProperty(WMQConstants.USER_AUTHENTICATION_MQCSP, true) e use createConnection(user, pass)
+	•	TLS (quando useTLS=true):
+	•	setSSLCipherSuite(cipherSuite)
+	•	Confiar em truststore via props de JVM (-Djavax.net.ssl.trustStore, etc.).
+	•	Fila/queue tuning por cliente:
+	•	Producer: ((MQQueue) queue).setPutAsyncAllowed(true) (quando non-persistent).
+	•	Consumer: ((MQQueue) queue).setReadAheadAllowed(WMQConstants.WMQ_READ_AHEAD_ALLOWED_ENABLED) (para non-persistent e não transacional).
+	•	Pooling: não crie uma Connection por mensagem. Use 1 Connection por requisição e N Sessions (multiplexa via SHARECNV do canal; reduz sockets).
+	•	Tratamento de MQRC 2009:
+	•	Habilite reconexão automática (acima).
+	•	Em cada worker, capture JMSException; se linkedException indicar 2009, reabra Session/Consumer/Producer e continue (limite de tentativas com backoff).
+	•	Limpeza: Fechar MessageProducer/Consumer, Session e Connection ao final da requisição (try-with-resources ou finalmente).
+	•	Métricas & Logs mínimos: tempo total, msgs por segundo, erros (contadores).
+
+⸻
+
+Arquitetura (pastas & classes)
+
+/api
+  /controller
+    - ProduceController.java
+    - ConsumeController.java
+/application
+  /usecase
+    - ProduceMessageUseCase.java
+    - ConsumeMessageUseCase.java
+/domain
+  /model
+    - ProduceRequest.java, MessageItem.java, QueueManagerConfig.java, TargetConfig.java, ProduceSettings.java
+    - ConsumeRequest.java, ConsumeSettings.java
+  /ports
+    - MessageProducerPort.java
+    - MessageConsumerPort.java
+/infrastructure
+  /messaging/ibmmq
+    - IbmMqConnectionFactoryBuilder.java
+    - IbmMqMessageProducerAdapter.java
+    - IbmMqMessageConsumerAdapter.java
+/config
+  - AsyncExecutorConfig.java         // ThreadPoolTaskExecutor p/ HTTP
+  - MessagingConfiguration.java      // Beans auxiliares (ObjectMapper, Duration parser, etc.)
+/observability
+  - (opcional) MetricsRecorder.java
+
+	•	Controllers: validam DTOs, chamam UseCases.
+	•	UseCases: orquestram paralelismo e divisão de trabalho. Não conhecem JMS.
+	•	Ports (domain): interfaces MessageProducerPort e MessageConsumerPort.
+	•	Adapters (infrastructure): implementam Ports usando IBM MQ JMS.
+	•	Builder: recebe QueueManagerConfig do payload e retorna MQQueueConnectionFactory configurado.
+
+⸻
+
+Assinaturas (ports)
+
+public interface MessageProducerPort {
+  ProduceResult send(ProduceRequest request);
+}
+
+public interface MessageConsumerPort {
+  ConsumeResult receive(ConsumeRequest request);
+}
+
+	•	ProduceResult: msgsEnviadas, duracaoMs, erros.
+	•	ConsumeResult: msgsLidas, duracaoMs, erros.
+
+⸻
+
+Regras de Paralelismo
+	•	/produce:
+	•	Divida totalMessages em concurrency fatias (última fatia absorve o resto).
+	•	Para cada fatia, 1 Session + 1 MessageProducer reusados no loop.
+	•	Envie em blocos de batchSize (apenas organização; não transacione).
+	•	Use CompletableFuture.runAsync(..., executor) para N workers e allOf().join().
+	•	/consume:
+	•	Divida maxMessages por concurrency como cota por worker.
+	•	Para cada worker: 1 Session + 1 MessageConsumer, connection.start() uma vez antes de iniciar o loop.
+	•	receive(Duration.of(waitTimeout).toMillis()) até bater a cota ou null.
+
+⸻
+
+Mapeamentos Importantes
+	•	TTL: producer.setTimeToLive(Duration.parse(timeToLive).toMillis())
+	•	DeliveryDelay: producer.setDeliveryDelay(Duration.parse(deliveryDelay).toMillis())
+	•	Persistent: producer.setDeliveryMode(persistent ? DeliveryMode.PERSISTENT : DeliveryMode.NON_PERSISTENT)
+	•	CorrelationId: message.setJMSCorrelationID(headers.get("CorrelationId"))
+	•	ReplyTo: se replyToQueue != null → message.setJMSReplyTo(session.createQueue(replyToQueue))
+	•	Properties: message.setStringProperty(k, v) (ou tipo adequado)
+	•	AUTO_ACK: session = createSession(false, Session.AUTO_ACKNOWLEDGE)
+	•	CLIENT_ACK (quando autoAcknowledge=false): session = createSession(false, Session.CLIENT_ACKNOWLEDGE) e msg.acknowledge() após processar
+
+⸻
+
+Boas Práticas que DEVEM estar no código
+	1.	1 Connection por requisição e N Sessions para paralelismo.
+	2.	Reconexão automática + TCP KeepAlive no ConnectionFactory.
+	3.	ReadAhead (consumer non-persistent) e PutAsync (producer non-persistent).
+	4.	Sem transações (foco em performance; use AUTO_ACK).
+	5.	Tratamento de MQRC 2009 com retentativas e backoff no nível de worker.
+	6.	Evitar criar/fechar Session a cada mensagem; reutilizar por worker.
+	7.	Fechamento ordenado (producer/consumer → session → connection).
+	8.	Clean/SOLID: controllers finos; usecases orquestram; adapters isolam IBM MQ.
+	9.	Logs & Métricas: total, por worker, erros, TPS.
+	10.	Validação dos DTOs (Bean Validation) e mensagens claras de erro.
+
+⸻
+
+Exemplos de trechos (somente conexão e queue tuning)
+
+Builder (conexão):
+
+var f = new com.ibm.mq.jakarta.jms.MQQueueConnectionFactory();
+f.setHostName(cfg.host());
+f.setPort(cfg.port());
+f.setQueueManager(cfg.qm());
+f.setChannel(cfg.channel());
+f.setTransportType(com.ibm.msg.client.wmq.WMQConstants.WMQ_CM_CLIENT);
+
+f.setStringProperty(com.ibm.msg.client.wmq.WMQConstants.WMQ_APPLICATIONNAME, "mq-probe-api");
+f.setIntProperty(com.ibm.msg.client.wmq.WMQConstants.WMQ_CLIENT_RECONNECT_OPTIONS,
+                 com.ibm.msg.client.wmq.WMQConstants.WMQ_CLIENT_RECONNECT);
+f.setIntProperty(com.ibm.msg.client.wmq.WMQConstants.WMQ_CLIENT_RECONNECT_TIMEOUT, 30);
+f.setBooleanProperty(com.ibm.msg.client.wmq.WMQConstants.WMQ_TCP_KEEP_ALIVE, true);
+
+if (cfg.useTLS()) {
+  f.setSSLCipherSuite(cfg.cipherSuite());
+  // truststore via -Djavax.net.ssl.trustStore / -Djavax.net.ssl.trustStorePassword
+}
+
+Producer (por worker):
+
+Connection c = (hasCreds) ? f.createConnection(user, pass) : f.createConnection();
+Session s = c.createSession(false, Session.AUTO_ACKNOWLEDGE);
+Queue q = s.createQueue(targetQueue);
+((com.ibm.mq.jakarta.jms.MQQueue) q).setPutAsyncAllowed(true); // non-persistent
+
+MessageProducer p = s.createProducer(q);
+p.setDeliveryMode(persistent ? DeliveryMode.PERSISTENT : DeliveryMode.NON_PERSISTENT);
+p.setTimeToLive(ttlMs);
+p.setDeliveryDelay(delayMs);
+// loop enviando a fatia...
+
+Consumer (por worker):
+
+Connection c = (hasCreds) ? f.createConnection(user, pass) : f.createConnection();
+Session s = sAck ? c.createSession(false, Session.AUTO_ACKNOWLEDGE)
+                 : c.createSession(false, Session.CLIENT_ACKNOWLEDGE);
+Queue q = s.createQueue(targetQueue);
+((com.ibm.mq.jakarta.jms.MQQueue) q)
+  .setReadAheadAllowed(com.ibm.msg.client.wmq.WMQConstants.WMQ_READ_AHEAD_ALLOWED_ENABLED);
+
+MessageConsumer consumer = s.createConsumer(q);
+c.start(); // obrigatório para consumir
+// loop recebendo até cota ou timeout...
+
+
+⸻
+
+Critérios de Aceite
+	•	/produce envia exatamente totalMessages; /consume lê até maxMessages respeitando waitTimeout.
+	•	Conexões estáveis durante múltiplas chamadas; sem criar uma conexão por mensagem.
+	•	Paralelismo efetivo por concurrency em ambos endpoints.
+	•	Reconexão automática configurada e testada (simular queda → retomada).
+	•	ReadAhead/PutAsync aplicados quando apropriado.
+	•	Código organizado por camadas, com ports/adapters e usecases claros.
+	•	Logs básicos e métricas de throughput.
+
+⸻
+
+Notas finais (operacionais):
+	•	No Queue Manager, garanta HBINT baixo (ex. 5–10s) e SHARECNV ≥ 10 no canal SVRCONN, evitando desconexões por inatividade e maximizando multiplexação.
+	•	Ajuste MaxChannels/MAXINST conforme volume de testes.
+
+Gere todos os arquivos, classes e configurações acima, prontos para build e execução. Use Jakarta JMS (pacote jakarta.jms) e as libs do IBM MQ Jakarta JMS. Siga os nomes de classes/pacotes propostos.
